@@ -1,0 +1,102 @@
+CREATE OR REPLACE FUNCTION cub.manage_registry_company_rows(
+    p_action smallint,       -- 1=INSERT, 0=UPDATE, -1=DELETE
+    p_reg_id bigint,         -- ID реестра
+    p_com_id bigint,         -- ID предприятия
+    p_div_name varchar DEFAULT NULL -- Название подразделения (NULL для головного предприятия)
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _result jsonb;
+    _rows_affected integer;
+    _new_row_id bigint;
+    _reg_type_id bigint;
+BEGIN
+    -- Проверка существования реестра и получение его типа
+    SELECT xq01regt_id INTO _reg_type_id 
+    FROM cub.xq01_registry 
+    WHERE xq01reg_id = p_reg_id;
+    
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'message', 'Реестр не найден');
+    END IF;
+
+    -- Проверка предприятия (кроме удаления)
+    IF p_action != -1 AND NOT EXISTS (SELECT 1 FROM sc_str.company WHERE com_id = p_com_id) THEN
+        RETURN jsonb_build_object('success', false, 'message', 'Предприятие не найдено');
+    END IF;
+
+    CASE p_action
+        WHEN 1 THEN -- INSERT
+            -- Вставка строк для всех услуг реестра данного типа
+            INSERT INTO cub.xq01_registry_row (
+                xq01reg_id, 
+                xq01regs_id, 
+                com_id, 
+                xq01regr_div_name
+            )
+            SELECT 
+                p_reg_id,
+                s.xq01regs_id,
+                p_com_id,
+                p_div_name
+            FROM cub.xq01_ref_registry_service s
+            WHERE s.xq01regt_id = _reg_type_id
+            RETURNING xq01regr_id INTO _new_row_id;
+            
+            GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+            
+            RETURN jsonb_build_object(
+                'success', true,
+                'rows_affected', _rows_affected,
+                'new_ids', (SELECT jsonb_agg(xq01regr_id) FROM cub.xq01_registry_row 
+                            WHERE xq01reg_id = p_reg_id AND com_id = p_com_id AND 
+                                 (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL))
+            );
+
+        WHEN 0 THEN -- UPDATE
+            -- Обновление всех строк предприятия в реестре (только подразделение)
+            UPDATE cub.xq01_registry_row
+            SET xq01regr_div_name = p_div_name
+            WHERE xq01reg_id = p_reg_id
+              AND com_id = p_com_id;
+              
+            GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+            
+            RETURN jsonb_build_object(
+                'success', true,
+                'rows_affected', _rows_affected
+            );
+
+        WHEN -1 THEN -- DELETE
+            -- Удаление всех строк предприятия в реестре
+            DELETE FROM cub.xq01_registry_row
+            WHERE xq01reg_id = p_reg_id
+              AND com_id = p_com_id
+              AND (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL))
+            RETURNING xq01regr_id INTO _new_row_id;
+            
+            IF _new_row_id IS NULL THEN
+                RETURN jsonb_build_object('success', false, 'message', 'Строки не найдены');
+            END IF;
+            
+            GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+            
+            RETURN jsonb_build_object(
+                'success', true,
+                'rows_affected', _rows_affected
+            );
+
+        ELSE
+            RETURN jsonb_build_object('success', false, 'message', 'Неизвестное действие: ' || p_action::text);
+    END CASE;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', SQLERRM,
+            'sqlstate', SQLSTATE
+        );
+END;
+$$;
