@@ -1,0 +1,158 @@
+CREATE OR REPLACE FUNCTION cub.manage_registry_rows(
+    p_action varchar,        -- 'INSERT', 'UPDATE' или 'DELETE'
+    p_reg_id bigint,         -- ID реестра
+    p_service_id bigint,     -- ID услуги
+    p_com_id bigint,         -- ID предприятия
+    p_div_name varchar DEFAULT NULL, -- Название подразделения (NULL для головного предприятия)
+    p_contract_id bigint DEFAULT NULL,
+    p_service_date date DEFAULT NULL,
+    p_service_quantity numeric(18,7) DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _result jsonb;
+    _rows_affected integer;
+    _new_row_id bigint;
+BEGIN
+    -- Проверка существования реестра и услуги
+    IF NOT EXISTS (SELECT 1 FROM cub.xq01_registry WHERE xq01reg_id = p_reg_id) THEN
+        RETURN jsonb_build_object('success', false, 'message', 'Реестр не найден');
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM cub.xq01_ref_registry_service WHERE xq01regs_id = p_service_id) THEN
+        RETURN jsonb_build_object('success', false, 'message', 'Услуга не найдена');
+    END IF;
+
+    -- Проверка предприятия (кроме удаления)
+    IF p_action != 'DELETE' AND NOT EXISTS (SELECT 1 FROM sc_str.company WHERE com_id = p_com_id) THEN
+        RETURN jsonb_build_object('success', false, 'message', 'Предприятие не найдено');
+    END IF;
+
+    CASE p_action
+        WHEN 'INSERT' THEN
+            -- Вставка строк для всех услуг предприятия (если p_service_id IS NULL)
+            IF p_service_id IS NULL THEN
+                -- Вставляем строки для всех услуг реестра
+                INSERT INTO cub.xq01_registry_row (
+                    xq01reg_id, 
+                    xq01regs_id, 
+                    com_id, 
+                    contract_id,
+                    xq01regr_div_name,
+                    xq01regr_service_date,
+                    xq01regr_service_quantity
+                )
+                SELECT 
+                    p_reg_id,
+                    s.xq01regs_id,
+                    p_com_id,
+                    p_contract_id,
+                    p_div_name,
+                    p_service_date,
+                    p_service_quantity
+                FROM cub.xq01_ref_registry_service s
+                JOIN cub.xq01_registry r ON s.xq01regt_id = r.xq01regt_id
+                WHERE r.xq01reg_id = p_reg_id
+                RETURNING xq01regr_id INTO _new_row_id;
+                
+                GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+                
+                RETURN jsonb_build_object(
+                    'success', true,
+                    'rows_affected', _rows_affected,
+                    'new_ids', (SELECT jsonb_agg(xq01regr_id) FROM cub.xq01_registry_row 
+                                WHERE xq01reg_id = p_reg_id AND com_id = p_com_id AND 
+                                     (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL))
+                );
+            ELSE
+                -- Вставка одной строки для конкретной услуги
+                INSERT INTO cub.xq01_registry_row (
+                    xq01reg_id, 
+                    xq01regs_id, 
+                    com_id, 
+                    contract_id,
+                    xq01regr_div_name,
+                    xq01regr_service_date,
+                    xq01regr_service_quantity
+                )
+                VALUES (
+                    p_reg_id,
+                    p_service_id,
+                    p_com_id,
+                    p_contract_id,
+                    p_div_name,
+                    p_service_date,
+                    p_service_quantity
+                )
+                RETURNING xq01regr_id INTO _new_row_id;
+                
+                RETURN jsonb_build_object(
+                    'success', true,
+                    'new_id', _new_row_id
+                );
+            END IF;
+
+        WHEN 'UPDATE' THEN
+            -- Обновление всех строк предприятия в реестре (если p_service_id IS NULL)
+            IF p_service_id IS NULL THEN
+                UPDATE cub.xq01_registry_row
+                SET 
+                    contract_id = COALESCE(p_contract_id, contract_id),
+                    xq01regr_service_date = COALESCE(p_service_date, xq01regr_service_date),
+                    xq01regr_service_quantity = COALESCE(p_service_quantity, xq01regr_service_quantity)
+                WHERE xq01reg_id = p_reg_id
+                  AND com_id = p_com_id
+                  AND (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL));
+                  
+                GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+                
+                RETURN jsonb_build_object(
+                    'success', true,
+                    'rows_affected', _rows_affected
+                );
+            ELSE
+                -- Обновление конкретной строки
+                UPDATE cub.xq01_registry_row
+                SET 
+                    contract_id = COALESCE(p_contract_id, contract_id),
+                    xq01regr_service_date = COALESCE(p_service_date, xq01regr_service_date),
+                    xq01regr_service_quantity = COALESCE(p_service_quantity, xq01regr_service_quantity)
+                WHERE xq01reg_id = p_reg_id
+                  AND xq01regs_id = p_service_id
+                  AND com_id = p_com_id
+                  AND (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL))
+                RETURNING xq01regr_id INTO _new_row_id;
+                
+                IF _new_row_id IS NULL THEN
+                    RETURN jsonb_build_object('success', false, 'message', 'Строка не найдена');
+                END IF;
+                
+                RETURN jsonb_build_object(
+                    'success', true,
+                    'updated_id', _new_row_id
+                );
+            END IF;
+
+        WHEN 'DELETE' THEN
+            -- Удаление всех строк предприятия в реестре (если p_service_id IS NULL)
+            IF p_service_id IS NULL THEN
+                DELETE FROM cub.xq01_registry_row
+                WHERE xq01reg_id = p_reg_id
+                  AND com_id = p_com_id
+                  AND (xq01regr_div_name = p_div_name OR (xq01regr_div_name IS NULL AND p_div_name IS NULL));
+                  
+                GET DIAGNOSTICS _rows_affected = ROW_COUNT;
+                
+                RETURN jsonb_build_object(
+                    'success', true,
+                    'rows_affected', _rows_affected
+                );
+            ELSE
+                -- Удаление конкретной строки
+                DELETE FROM cub.xq01_registry_row
+                WHERE xq01reg_id = p_reg_id
+                  AND xq01regs_id = p_service_id
+                  AND com_id = p_com_id
+                  AND (xq01regr_div_name = p_div_name OR (xq01regr
