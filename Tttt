@@ -1,0 +1,100 @@
+CREATE OR REPLACE FUNCTION cub.get_grouped_services_by_type(
+    _xq01regt_id bigint,       -- ID типа реестра
+    _show_deleted boolean DEFAULT FALSE -- Показывать удаленные услуги
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _result jsonb;
+    _count integer;
+BEGIN
+    WITH 
+    -- Получаем все услуги для типа реестра
+    _cte_services AS (
+        SELECT 
+            regs.xq01regs_id,
+            regs.xq01regt_id,
+            regs.ut_code,
+            regs.xq01regs_order,
+            regs.xq01regs_name,
+            regs.xq01regs_date_del,
+            -- Признак удаленности на текущий момент
+            (regs.xq01regs_date_del IS NOT NULL AND 
+             regs.xq01regs_date_del <= CURRENT_DATE) AS is_currently_deleted
+        FROM cub.xq01_ref_registry_service regs
+        WHERE regs.xq01regt_id = _xq01regt_id
+          AND (_show_deleted OR regs.xq01regs_date_del IS NULL OR regs.xq01regs_date_del > CURRENT_DATE)
+    ),
+    -- Группируем по имени услуги
+    _cte_grouped_services AS (
+        SELECT 
+            regs.xq01regs_name,
+            -- Статус активности (если есть хотя бы одна активная версия)
+            BOOL_OR(NOT regs.is_currently_deleted) AS has_active_version,
+            -- Последняя удаленная версия (если есть)
+            MAX(regs.xq01regs_date_del) FILTER (WHERE regs.is_currently_deleted) AS last_deleted_date,
+            -- Код заказа из активной или последней удаленной версии
+            COALESCE(
+                MAX(regs.xq01regs_order) FILTER (WHERE NOT regs.is_currently_deleted),
+                MAX(regs.xq01regs_order) FILTER (WHERE regs.is_currently_deleted)
+            ) AS service_order,
+            -- Код единицы измерения из активной или последней удаленной версии
+            COALESCE(
+                MAX(regs.ut_code) FILTER (WHERE NOT regs.is_currently_deleted),
+                MAX(regs.ut_code) FILTER (WHERE regs.is_currently_deleted)
+            ) AS ut_code,
+            -- Список всех ID услуг с этим именем
+            JSONB_AGG(regs.xq01regs_id) AS service_ids
+        FROM _cte_services regs
+        GROUP BY regs.xq01regs_name
+    ),
+    -- Получаем последнюю цену для каждой группы услуг
+    _cte_lastest_price AS (
+        SELECT 
+            gs.xq01regs_name,
+            sp.xq01regp_price,
+            sp.xq01regp_date_begin,
+            sp.xq01regp_date_end,
+            ROW_NUMBER() OVER (
+                PARTITION BY gs.xq01regs_name
+                ORDER BY sp.xq01regp_date_begin DESC
+            ) AS rn
+        FROM _cte_grouped_services gs
+        JOIN cub.xq01_ref_registry_service_price sp ON 
+            sp.xq01regs_id IN (SELECT jsonb_array_elements_text(gs.service_ids)::bigint)
+    )
+    
+    -- Формируем итоговый результат
+    SELECT JSONB_AGG(t), COUNT(*)
+    INTO _result, _count
+    FROM (
+        SELECT 
+            gs.xq01regs_name,
+            gs.has_active_version,
+            gs.last_deleted_date,
+            gs.ut_code,
+            ut._ut_designation,
+            COALESCE(LPAD(gs.service_order::varchar, 5, '0'), '99999') AS xq01regs_order,
+            lp.xq01regp_price AS last_price,
+            lp.xq01regp_date_begin AS price_start_date,
+            lp.xq01regp_date_end AS price_end_date
+        FROM _cte_grouped_services gs
+        LEFT JOIN sc_ref.units ut ON ut._ut_code = gs.ut_code
+        LEFT JOIN _cte_lastest_price lp ON 
+            lp.xq01regs_name = gs.xq01regs_name AND lp.rn = 1
+        ORDER BY gs.xq01regs_name
+    ) AS t;
+
+    RETURN JSONB_BUILD_OBJECT(
+        'success', true,
+        'count', _count,
+        'data', _result
+    );
+EXCEPTION WHEN OTHERS THEN
+    RETURN JSONB_BUILD_OBJECT(
+        'success', false,
+        'message', SQLERRM
+    );
+END;
+$$;
